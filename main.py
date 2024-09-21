@@ -1,110 +1,224 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List
+from fastapi import FastAPI, Depends, HTTPException, Query
+from sqlalchemy import create_engine, MetaData, func
+from sqlalchemy.ext.automap import automap_base
+from sqlalchemy.orm import sessionmaker, Session
+from datetime import datetime, timedelta
+import numpy as np
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
+
+# Database configuration (replace with your connection string)
+DATABASE_URL = "mssql+pyodbc://Prospect:DevEvaluation#2024@164.52.200.249:8524/DevEvaluation?driver=ODBC+Driver+17+for+SQL+Server"
+
+# Create the SQLAlchemy engine
+engine = create_engine(DATABASE_URL)
+
+# Reflect the tables
+metadata = MetaData()
+metadata.reflect(bind=engine)
+
+# Automap base to automatically generate ORM models from the reflected tables
+Base = automap_base(metadata=metadata)
+Base.prepare()
+
+# Access your existing tables as Python ORM models
+CustomerMaster = Base.classes.customer_master
+GoodsSale = Base.classes.goods_sale
+GoodsSaleItems = Base.classes.goods_sale_items
+ItemMaster = Base.classes.item_master
+PurchaseOrder = Base.classes.purchase_order
+PurchasedItems = Base.classes.purchased_items
+SupplierMaster = Base.classes.supplier_master
+
+# Create a session factory
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# FastAPI app
 app = FastAPI()
-
-
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Adjust this as per your frontend domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-class Location(BaseModel):
-    name: str
-    longitude: float
-    latitude: float
-    sales: int
+# Dependency to get DB session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-class Product(BaseModel):
-    name: str
-    value: float
-    amount: str
+# Helper function to calculate seasonal index
+def calculate_seasonal_index(sales_data):
+    monthly_sales = {}
+    for sale_date, quantity in sales_data:
+        month = sale_date.month
+        if month not in monthly_sales:
+            monthly_sales[month] = []
+        monthly_sales[month].append(quantity)
+    
+    monthly_averages = {month: np.mean(quantities) for month, quantities in monthly_sales.items()}
+    overall_average = np.mean(list(monthly_averages.values()))
+    seasonal_index = {month: avg / overall_average for month, avg in monthly_averages.items()}
+    return seasonal_index
 
-class SalesData(BaseModel):
-    labels: List[str]
-    datasets: List[dict]
+# Forecast future demand using the seasonal index, rounding to two decimal places
+def forecast_demand(base_demand, seasonal_index, month):
+    return round(base_demand * seasonal_index.get(month, 1), 2)
 
-class Customer(BaseModel):
-    id: str
-    country: str
-    date: str
-    purchases: int
-    sales: str
+@app.get("/procurement-plan")
+def create_procurement_plan(
+    date: str = Query(...),
+    months: int = Query(1, gt=0, le=12),  # Default to 1 month, valid range 1-12
+    db: Session = Depends(get_db)
+):
+    # Parse the provided date
+    try:
+        cutoff_date = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use 'YYYY-MM-DD'.")
 
+    # Calculate the future date based on the number of months
+    future_date = cutoff_date + timedelta(days=months * 30)  # Approximate to 30 days per month
 
-locations = [
-    {
-      "name": "United Kingdom",
-      "longitude": -0.1276,
-      "latitude": 51.5074,
-      "sales": 467100,
-    },
-    { "name": "Netherlands", "longitude": 4.9041, "latitude": 52.3676, "sales": 22400 },
-    { "name": "EIRE", "longitude": -6.2603, "latitude": 53.3498, "sales": 18300 },
-    { "name": "France", "longitude": 2.3522, "latitude": 48.8566, "sales": 14600 },
-    { "name": "Germany", "longitude": 13.405, "latitude": 52.52, "sales": 14400 },
-]
+    procurement_plan = []
 
-products = [
-    { "name": "Jumbo bag strawberry", "value": 0.9, "amount": "$4.7K" },
-    { "name": "Party bunting", "value": 0.4, "amount": "$3.3K" },
-    { "name": "Regency cakestand 3 tier", "value": 0.2, "amount": "$2.7K" },
-    { "name": "Postage", "value": 0.16, "amount": "$1.7K" },
-    { "name": "White hanging heart t-light holder", "value": 0.1, "amount": "$1K" },
-]
+    # Fetch all items from ItemMaster
+    items = db.query(ItemMaster).all()
 
-sales_data = {
-    "labels": ['26 Feb', '3 Mar', '8 Mar', '13 Mar', '18 Mar', '23 Mar', '28 Mar', '2 Apr'],
-    "datasets": [
-        {
-            "type": 'bar',
-            "label": 'Sales',
-            "data": [20, 30, 25, 35, 40, 50, 45, 60],
-            "backgroundColor": 'rgba(54, 162, 235, 0.5)',
-            "borderColor": 'rgba(54, 162, 235, 1)',
-            "borderWidth": 1,
-        },
-        {
-            "type": 'line',
-            "label": 'Number of Purchases',
-            "data": [10, 15, 13, 20, 18, 23, 21, 27],
-            "fill": False,
-            "borderColor": 'rgba(255, 99, 132, 1)',
-            "tension": 0.4,
-        },
-    ],
-}
+    # Batch fetch sales and purchase data
+    sales_data = db.query(GoodsSale.sale_date, GoodsSaleItems.item_id, GoodsSaleItems.quantity)\
+        .join(GoodsSaleItems, GoodsSale.sale_id == GoodsSaleItems.sale_id)\
+        .filter(GoodsSale.sale_date <= cutoff_date)\
+        .all()
 
-customers = [
-    { "id": '14646', "country": 'Netherlands', "date": '30 Mar 2022', "purchases": 4, "sales": '$21.5K' },
-    { "id": '15646', "country": 'United Kingdom', "date": '22 Mar 2022', "purchases": 2, "sales": '$17.8K' },
-    { "id": '14766', "country": 'EIRE', "date": '3 Mar 2022', "purchases": 1, "sales": '$15.6K' },
-    { "id": '19646', "country": 'France', "date": '12 Mar 2022', "purchases": 2, "sales": '$12.2K' },
-    { "id": '15746', "country": 'Germany', "date": '3 Mar 2022', "purchases": 4, "sales": '$10.5K' },
-    { "id": '19246', "country": 'France', "date": '26 Mar 2022', "purchases": 3, "sales": '$10K' },
-]
+    purchase_data = db.query(PurchasedItems.item_id, PurchasedItems.delivered_quantity, PurchaseOrder.po_id)\
+        .join(PurchaseOrder, PurchaseOrder.po_id == PurchasedItems.po_id)\
+        .filter(PurchasedItems.delivery_date <= cutoff_date)\
+        .all()
 
-@app.get("/locations", response_model=List[Location])
-async def get_locations():
-    return locations
+    for item in items:
+        item_id = item.item_id
 
-@app.get("/products", response_model=List[Product])
-async def get_products():
-    return products
+        # Fetch sales and purchase data for the item
+        item_sales_data = [(sale_date, quantity) for sale_date, item_id_, quantity in sales_data if item_id_ == item_id]
+        item_purchase_data = [data for data in purchase_data if data.item_id == item_id]
 
-@app.get("/sales_data", response_model=SalesData)
-async def get_sales_data():
-    return sales_data
+        if not item_sales_data:
+            continue  # Skip if no sales data found
 
-@app.get("/customers", response_model=List[Customer])
-async def get_customers():
-    return customers
+        # Calculate total sales and purchases
+        total_sales = sum([quantity for _, quantity in item_sales_data])
+        total_purchases = sum([data.delivered_quantity for data in item_purchase_data])
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        # Calculate available stock
+        available_stock = total_purchases - total_sales
+
+        # Fetch minimum stock level for the item
+        minimum_stock = item.minimum_quantity
+
+        # Calculate seasonal index and base demand
+        seasonal_index = calculate_seasonal_index(item_sales_data)
+        base_demand = total_sales / len(item_sales_data)
+
+        # Forecast demand for the specified future period
+        forecasted_demand = sum(
+            forecast_demand(base_demand, seasonal_index, (cutoff_date.month + i - 1) % 12 + 1)
+            for i in range(1, months + 1)
+        )
+
+        # Determine if an order is needed
+        if forecasted_demand > available_stock:
+            required_quantity = forecasted_demand - available_stock
+               # Round the required quantity to the nearest larger multiple of 10
+            order_quantity = (int((required_quantity + 9) / 10)) * 10
+
+            # Find the best supplier based on delivery time and reliability
+            supplier_data = db.query(SupplierMaster.supplier_name, PurchaseOrder.po_date, PurchasedItems.delivery_date,
+                                     PurchasedItems.ordered_quantity, PurchasedItems.delivered_quantity)\
+                .join(PurchaseOrder, PurchaseOrder.supplier_id == SupplierMaster.supplier_id)\
+                .filter(PurchasedItems.item_id == item_id)\
+                .all()
+
+            if not supplier_data:
+                continue  # Skip if no suppliers found
+
+            best_supplier = None
+            best_delivery_time = float('inf')
+            best_reliability = -1
+
+            for supplier_name, po_date, delivery_date, ordered_quantity, delivered_quantity in supplier_data:
+                delivery_time = (delivery_date - po_date).days
+                if delivery_time < 0:
+                    continue  # Skip invalid delivery times
+
+                reliability = delivered_quantity / ordered_quantity if ordered_quantity > 0 else 0
+
+                if delivery_time < best_delivery_time or (delivery_time == best_delivery_time and reliability > best_reliability):
+                    best_supplier = supplier_name
+                    best_delivery_time = delivery_time
+                    best_reliability = reliability
+
+            procurement_plan.append({
+                "item_name": item.item_name,
+                "available_stock": available_stock,
+                "forecasted_demand": forecasted_demand,
+                "order_required": True,
+                "minimum_quantity":minimum_stock,
+                "order_quantity": order_quantity,
+                "best_supplier": best_supplier,
+                "delivery_time": best_delivery_time,
+                "reliability": best_reliability,
+            })
+        else:
+            # Check if available stock is below minimum stock level
+            if available_stock < minimum_stock:
+                # Calculate the required order quantity
+                required_quantity = minimum_stock - available_stock
+
+                # Round the required quantity to the nearest larger multiple of 10
+                order_quantity = (int((required_quantity + 9) / 10)) * 10
+
+                # Find the best supplier even if stock is below minimum
+                supplier_data = db.query(SupplierMaster.supplier_name, PurchaseOrder.po_date, PurchasedItems.delivery_date,
+                                         PurchasedItems.ordered_quantity, PurchasedItems.delivered_quantity)\
+                    .join(PurchaseOrder, PurchaseOrder.supplier_id == SupplierMaster.supplier_id)\
+                    .filter(PurchasedItems.item_id == item_id)\
+                    .all()
+
+                if not supplier_data:
+                    continue  # Skip if no suppliers found
+
+                best_supplier = None
+                best_delivery_time = float('inf')
+                best_reliability = -1
+
+                for supplier_name, po_date, delivery_date, ordered_quantity, delivered_quantity in supplier_data:
+                    delivery_time = (delivery_date - po_date).days
+                    if delivery_time < 0:
+                        continue  # Skip invalid delivery times
+
+                    reliability = delivered_quantity / ordered_quantity if ordered_quantity > 0 else 0
+
+                    if delivery_time < best_delivery_time or (delivery_time == best_delivery_time and reliability > best_reliability):
+                        best_supplier = supplier_name
+                        best_delivery_time = delivery_time
+                        best_reliability = reliability
+
+                procurement_plan.append({
+                    "item_name": item.item_name,
+                    "available_stock": available_stock,
+                    "forecasted_demand": forecasted_demand,
+                    "order_required": True,
+                    "minimum_quantity":minimum_stock,
+                    "order_quantity": order_quantity,
+                    "best_supplier": best_supplier,
+                    "delivery_time": best_delivery_time,
+                    "reliability": best_reliability,
+                    # "message": "Stock is below minimum required level."
+                })
+
+    return {"procurement_plan": procurement_plan}
